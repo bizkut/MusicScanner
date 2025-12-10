@@ -536,22 +536,60 @@ def process_file(file_path: Path, folder_path: Path, metadata: Dict[str, Optiona
         return 'success', dest_path
 
 
-def cleanup_empty_directories(folder_path: Path, verbose: bool = False):
+def cleanup_empty_directories(folder_path: Path, verbose: bool = False, quiet: bool = False):
     """Remove empty directories after organization."""
-    print("\n🧹 Cleaning up empty directories...")
+    if not quiet:
+        print("\n🧹 Cleaning up empty directories...")
+    
+    removed_count = 0
+    # Junk files that can be safely removed
+    junk_files = {'.DS_Store', 'Thumbs.db', 'desktop.ini', '._.DS_Store'}
+    
     for root, dirs, files in os.walk(folder_path, topdown=False):
-        # Skip hidden directories
-        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        root_path = Path(root)
         
-        for dir_name in dirs:
-            dir_path = Path(root) / dir_name
-            try:
-                if dir_path.exists() and not any(dir_path.iterdir()):
-                    dir_path.rmdir()
+        # Skip the root folder itself
+        if root_path == folder_path:
+            continue
+        
+        # Remove junk files first
+        for file in files:
+            if file in junk_files:
+                try:
+                    (root_path / file).unlink()
+                except Exception:
+                    pass
+        
+        # Check if directory is now empty (or only has hidden files)
+        try:
+            remaining = list(root_path.iterdir())
+            # Filter out hidden files for the "empty" check
+            non_hidden = [f for f in remaining if not f.name.startswith('.')]
+            
+            if not non_hidden and not remaining:
+                # Truly empty
+                root_path.rmdir()
+                removed_count += 1
+                if verbose:
+                    print(f"   Removed: {root_path.relative_to(folder_path)}")
+            elif not non_hidden and remaining:
+                # Only hidden junk left - remove those too
+                for f in remaining:
+                    try:
+                        f.unlink()
+                    except Exception:
+                        pass
+                # Try removing now
+                if not any(root_path.iterdir()):
+                    root_path.rmdir()
+                    removed_count += 1
                     if verbose:
-                        print(f"   Removed empty: {dir_path.relative_to(folder_path)}")
-            except Exception:
-                pass
+                        print(f"   Removed: {root_path.relative_to(folder_path)}")
+        except Exception:
+            pass
+    
+    if not quiet and removed_count > 0:
+        print(f"   Removed {removed_count} empty directories")
 
 
 def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = False,
@@ -740,7 +778,7 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
     
     # Clean up empty directories
     if not dry_run:
-        cleanup_empty_directories(folder_path, verbose)
+        cleanup_empty_directories(folder_path, verbose, quiet)
     
     # Save logs and generate undo script
     if not dry_run:
