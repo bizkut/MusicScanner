@@ -282,9 +282,14 @@ def identify_batch_with_gemini(files_data: List[Dict[str, Any]],
 
 {batch_context}
 
-IMPORTANT: Determine if each is a COMPILATION album (soundtracks, "Various Artists", etc.)
-- For regular albums: album_artist = artist
-- For compilations: album_artist = "Various Artists"
+IMPORTANT RULES:
+1. For COMPILATION albums (soundtracks, "Various Artists", etc.): album_artist = "Various Artists"
+2. For regular albums: album_artist = artist
+3. ALWAYS try to identify the correct album name. You have extensive music knowledge - use it!
+   - If you recognize the song and artist, provide the ACTUAL album it was released on
+   - For example: "It's My Life" by Bon Jovi is from the album "Crush"
+   - Only use "Singles" if the song was never released on a studio album
+   - NEVER return "Unknown" for album if you can reasonably guess it
 
 Respond with a JSON array of objects, one per file, in order:
 [
@@ -292,7 +297,7 @@ Respond with a JSON array of objects, one per file, in order:
   {{"file": 2, "artist": "...", "album_artist": "...", "album": "...", "title": "...", "is_compilation": false}}
 ]
 
-Use "Unknown" for fields you can't determine. No markdown, just the JSON array.
+No markdown, just the JSON array.
 """
 
     response_text = ""
