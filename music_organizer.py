@@ -38,8 +38,11 @@ load_dotenv()
 
 # Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")  # Can override via .env
 SUPPORTED_FORMATS = {'.mp3', '.flac', '.wav', '.m4a', '.aac', '.ogg', '.wma', '.opus'}
-API_RATE_LIMIT_DELAY = 1.0  # seconds between batch API calls
+API_RATE_LIMIT_DELAY = 6.0  # seconds between batch API calls (10 req/min limit = 6s min)
+MAX_RETRIES = 3
+RETRY_BASE_DELAY = 10  # seconds, will exponentially increase
 SKIP_DIRECTORIES = {'.git', '.svn', '__pycache__', 'node_modules'}
 BATCH_SIZE = 10  # Number of files to identify per API call
 
@@ -293,63 +296,84 @@ Use "Unknown" for fields you can't determine. No markdown, just the JSON array.
 """
 
     response_text = ""
-    try:
-        model = genai.GenerativeModel('gemini-2.0-flash-exp')
-        response = model.generate_content(prompt)
-        response_text = response.text.strip()
-        
-        # Rate limiting after call
-        time.sleep(API_RATE_LIMIT_DELAY)
-        
-        # Clean up response
-        if response_text.startswith('```'):
-            response_text = re.sub(r'^```(?:json)?\s*', '', response_text)
-            response_text = re.sub(r'\s*```$', '', response_text)
-        
-        batch_results = json.loads(response_text)
-        
-        # Map results back to filenames
-        for i, file_data in enumerate(uncached_files):
-            filename = file_data['filename']
-            metadata = file_data['metadata']
-            
-            if i < len(batch_results):
-                result = batch_results[i]
-                identified: Dict[str, Any] = {
-                    'artist': sanitize_filename(result.get('artist', 'Unknown Artist')),
-                    'album_artist': sanitize_filename(result.get('album_artist', result.get('artist', 'Unknown Artist'))),
-                    'album': sanitize_filename(result.get('album', 'Unknown Album')),
-                    'title': sanitize_filename(result.get('title', 'Unknown Title')),
-                    'is_compilation': result.get('is_compilation', False)
-                }
-            else:
-                # Fallback if response is incomplete
-                artist = metadata.get('artist') or 'Unknown Artist'
-                identified = {
-                    'artist': artist,
-                    'album_artist': metadata.get('album_artist') or artist,
-                    'album': metadata.get('album') or 'Unknown Album',
-                    'title': metadata.get('title') or Path(filename).stem,
-                    'is_compilation': False
-                }
-            
-            results[filename] = identified
-            
-            # Cache result
-            if cache:
-                cache_key = f"{filename}|{metadata.get('artist')}|{metadata.get('album')}"
-                cache.set(cache_key, identified)
-        
-        return results
-        
-    except json.JSONDecodeError as e:
-        if not quiet:
-            print(f"  Warning: Could not parse batch Gemini response: {e}")
-    except Exception as e:
-        if not quiet:
-            print(f"  Warning: Gemini batch API error: {e}")
+    last_error = None
     
-    # Fallback for all files in batch
+    for attempt in range(MAX_RETRIES):
+        try:
+            model = genai.GenerativeModel(GEMINI_MODEL)
+            response = model.generate_content(prompt)
+            response_text = response.text.strip()
+            
+            # Rate limiting after successful call
+            time.sleep(API_RATE_LIMIT_DELAY)
+            
+            # Clean up response
+            if response_text.startswith('```'):
+                response_text = re.sub(r'^```(?:json)?\s*', '', response_text)
+                response_text = re.sub(r'\s*```$', '', response_text)
+            
+            batch_results = json.loads(response_text)
+            
+            # Map results back to filenames
+            for i, file_data in enumerate(uncached_files):
+                filename = file_data['filename']
+                metadata = file_data['metadata']
+                
+                if i < len(batch_results):
+                    result = batch_results[i]
+                    identified: Dict[str, Any] = {
+                        'artist': sanitize_filename(result.get('artist', 'Unknown Artist')),
+                        'album_artist': sanitize_filename(result.get('album_artist', result.get('artist', 'Unknown Artist'))),
+                        'album': sanitize_filename(result.get('album', 'Unknown Album')),
+                        'title': sanitize_filename(result.get('title', 'Unknown Title')),
+                        'is_compilation': result.get('is_compilation', False)
+                    }
+                else:
+                    # Fallback if response is incomplete
+                    artist = metadata.get('artist') or 'Unknown Artist'
+                    identified = {
+                        'artist': artist,
+                        'album_artist': metadata.get('album_artist') or artist,
+                        'album': metadata.get('album') or 'Unknown Album',
+                        'title': metadata.get('title') or Path(filename).stem,
+                        'is_compilation': False
+                    }
+                
+                results[filename] = identified
+                
+                # Cache result
+                if cache:
+                    cache_key = f"{filename}|{metadata.get('artist')}|{metadata.get('album')}"
+                    cache.set(cache_key, identified)
+            
+            return results
+            
+        except json.JSONDecodeError as e:
+            if not quiet:
+                print(f"  Warning: Could not parse Gemini response: {e}")
+            last_error = e
+            break  # Don't retry parse errors
+            
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            
+            # Check for rate limit (429)
+            if '429' in error_str or 'quota' in error_str.lower():
+                retry_delay = RETRY_BASE_DELAY * (2 ** attempt)
+                if not quiet:
+                    print(f"  ⏳ Rate limited. Waiting {retry_delay}s before retry {attempt + 1}/{MAX_RETRIES}...")
+                time.sleep(retry_delay)
+                continue
+            else:
+                if not quiet:
+                    print(f"  Warning: Gemini API error: {e}")
+                break  # Don't retry other errors
+    
+    # Fallback for all files in batch after all retries failed
+    if not quiet and last_error:
+        print(f"  Using fallback metadata after API failure")
+        
     for file_data in uncached_files:
         filename = file_data['filename']
         metadata = file_data['metadata']
