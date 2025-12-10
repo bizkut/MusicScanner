@@ -202,11 +202,9 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
             artist_folder = folder_path / identified['artist']
             album_folder = artist_folder / identified['album']
             
-            # Build new filename
-            if metadata.get('track_number'):
-                new_filename = f"{metadata['track_number']} - {identified['title']}{file_path.suffix.lower()}"
-            else:
-                new_filename = f"{identified['title']}{file_path.suffix.lower()}"
+            # Build new filename: Artist - Album - TrackNumber - Title
+            track_num = metadata.get('track_number') or "00"
+            new_filename = f"{identified['artist']} - {identified['album']} - {track_num} - {identified['title']}{file_path.suffix.lower()}"
             
             dest_path = album_folder / new_filename
             
