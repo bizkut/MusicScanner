@@ -4,14 +4,15 @@ A Python script that scans a music folder, identifies songs/albums/artists using
 
 ## ✨ Features
 
-- **AI-Powered Identification** - Uses Gemini API to identify artist, album, and title from filenames
+- **AI-Powered Identification** - Uses Gemini API to identify artist, album, and title
+- **Batch Processing** - Sends 10 files per API call to reduce rate limiting
+- **Retry with Backoff** - Automatic retry on rate limits (429 errors)
 - **Compilation Support** - Detects "Various Artists" albums and soundtracks
 - **Fast Operations** - Uses instant rename/move (no file copying)
 - **Resume Support** - Skips already-organized files
 - **Undo Script** - Auto-generates shell script to reverse all changes
 - **Change Logging** - JSON log of all operations for auditing
 - **Response Caching** - Reduces API calls for repeated runs
-- **Graceful Interrupts** - Ctrl+C saves progress before exit
 
 ## 📁 Output Structure
 
@@ -56,6 +57,14 @@ Options:
   --verbose, -v   Show detailed per-file output
   --quiet, -q     Minimal output
   --no-skip       Re-process already organized files
+```
+
+## ⚙️ Configuration
+
+Create a `.env` file:
+```bash
+GEMINI_API_KEY=your_api_key_here
+GEMINI_MODEL=gemini-2.0-flash  # Optional, this is the default
 ```
 
 ## 📄 Generated Files
