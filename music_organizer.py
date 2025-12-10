@@ -449,25 +449,17 @@ def process_file(file_path: Path, folder_path: Path, metadata: Dict[str, Optiona
         # Create directories
         album_folder.mkdir(parents=True, exist_ok=True)
         
-        # SAFE MOVE: Copy first, verify, then delete original
-        # Step 1: Copy file to destination
-        shutil.copy2(str(file_path), str(dest_path))
-        
-        # Step 2: Verify copy succeeded (check file exists and size matches)
-        if dest_path.exists() and dest_path.stat().st_size == file_path.stat().st_size:
-            # Step 3: Only delete original after verified copy
-            file_path.unlink()
+        # Direct move (instant on same filesystem via os.rename)
+        try:
+            shutil.move(str(file_path), str(dest_path))
             if verbose:
                 print(f"  ✅ Moved to: {dest_path.relative_to(folder_path)}")
             logger.log_move(file_path, dest_path, identified)
             return 'success', dest_path
-        else:
-            # Copy failed - remove incomplete copy, keep original
-            if dest_path.exists():
-                dest_path.unlink()
+        except Exception as e:
             if not quiet:
-                print(f"  ⚠️  Copy verification failed, original kept safe")
-            logger.log_error(file_path, "Copy verification failed")
+                print(f"  ⚠️  Move failed: {e}")
+            logger.log_error(file_path, f"Move failed: {e}")
             return 'error', None
     else:
         if verbose:
