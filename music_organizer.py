@@ -40,7 +40,8 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPPORTED_FORMATS = {'.mp3', '.flac', '.wav', '.m4a', '.aac', '.ogg', '.wma', '.opus'}
 API_RATE_LIMIT_DELAY = 0.5  # seconds between API calls
-SKIP_DIRECTORIES = {'.git', '.svn', '__pycache__', 'node_modules', '.DS_Store'}
+SKIP_DIRECTORIES = {'.git', '.svn', '__pycache__', 'node_modules'}
+PROGRESS_INTERVAL = 50  # Print progress every N files in quiet mode
 
 # Initialize Gemini
 if GEMINI_API_KEY:
@@ -387,7 +388,7 @@ def is_already_organized(file_path: Path, folder_path: Path) -> bool:
 
 def process_file(file_path: Path, folder_path: Path, metadata: Dict[str, Optional[str]],
                  identified: Dict[str, Any], dry_run: bool, verbose: bool,
-                 logger: ChangeLogger) -> Tuple[str, Optional[Path]]:
+                 quiet: bool, logger: ChangeLogger) -> Tuple[str, Optional[Path]]:
     """
     Process a single file for organization.
     Returns: (status, dest_path) where status is 'success', 'skip', or 'error'
@@ -430,7 +431,8 @@ def process_file(file_path: Path, folder_path: Path, metadata: Dict[str, Optiona
     dest_normalized = str((album_folder / new_filename).resolve()).lower()
     
     if source_normalized == dest_normalized:
-        print(f"  ⏭️  Already organized")
+        if verbose:
+            print(f"  ⏭️  Already organized")
         logger.log_skip(file_path, "Already at destination")
         return 'skip', None
     
@@ -455,18 +457,21 @@ def process_file(file_path: Path, folder_path: Path, metadata: Dict[str, Optiona
         if dest_path.exists() and dest_path.stat().st_size == file_path.stat().st_size:
             # Step 3: Only delete original after verified copy
             file_path.unlink()
-            print(f"  ✅ Moved to: {dest_path.relative_to(folder_path)}")
+            if verbose:
+                print(f"  ✅ Moved to: {dest_path.relative_to(folder_path)}")
             logger.log_move(file_path, dest_path, identified)
             return 'success', dest_path
         else:
             # Copy failed - remove incomplete copy, keep original
             if dest_path.exists():
                 dest_path.unlink()
-            print(f"  ⚠️  Copy verification failed, original kept safe")
+            if not quiet:
+                print(f"  ⚠️  Copy verification failed, original kept safe")
             logger.log_error(file_path, "Copy verification failed")
             return 'error', None
     else:
-        print(f"  🔍 Would move to: {dest_path.relative_to(folder_path)}")
+        if verbose:
+            print(f"  🔍 Would move to: {dest_path.relative_to(folder_path)}")
         return 'success', dest_path
 
 
@@ -489,7 +494,7 @@ def cleanup_empty_directories(folder_path: Path, verbose: bool = False):
 
 
 def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = False,
-                   skip_organized: bool = True) -> Tuple[int, int]:
+                   skip_organized: bool = True, quiet: bool = False) -> Tuple[int, int]:
     """
     Main function to organize music files in-place.
     Returns tuple of (successful_count, failed_count)
@@ -535,15 +540,17 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
     successful = 0
     failed = 0
     skipped = 0
+    current_album = None  # Track current album for progress output
+    albums_processed = 0
     
     # Process each file
+    total_files = len(audio_files)
     for i, file_path in enumerate(audio_files, 1):
-        print(f"[{i}/{len(audio_files)}] Processing: {file_path.name}")
-        
         try:
             # Resume support: skip already organized files
             if skip_organized and is_already_organized(file_path, folder_path):
-                print(f"  ⏭️  Already in organized structure, skipping")
+                if verbose:
+                    print(f"  ⏭️  Already in organized structure, skipping")
                 logger.log_skip(file_path, "Already organized")
                 skipped += 1
                 continue
@@ -574,9 +581,22 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
                     'is_compilation': False
                 }
             
+            # Progress output: print when album changes
+            album_key = f"{identified.get('album_artist', identified['artist'])}/{identified['album']}"
+            if album_key != current_album:
+                current_album = album_key
+                albums_processed += 1
+                if not quiet:
+                    print(f"[{i}/{total_files}] 💿 {album_key}")
+                elif verbose:
+                    print(f"[{i}/{total_files}] Processing album: {album_key}")
+            
+            if verbose:
+                print(f"  → {file_path.name}")
+            
             # Process the file
             status, dest = process_file(file_path, folder_path, metadata, identified,
-                                        dry_run, verbose, logger)
+                                        dry_run, verbose, quiet, logger)
             
             if status == 'success':
                 successful += 1
@@ -586,9 +606,14 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
                 failed += 1
             
         except Exception as e:
-            print(f"  ❌ Error: {e}")
+            if not quiet:
+                print(f"  ❌ Error: {e}")
             logger.log_error(file_path, str(e))
             failed += 1
+    
+    # Clear progress line in quiet mode
+    if quiet:
+        print()
     
     # Clean up empty directories
     if not dry_run:
@@ -610,10 +635,11 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
     print(f"\n{'='*50}")
     print(f"📊 Summary")
     print(f"{'='*50}")
+    print(f"   💿 Albums: {albums_processed}")
     print(f"   ✅ Successful: {successful}")
     print(f"   ⏭️  Skipped: {skipped}")
     print(f"   ❌ Failed: {failed}")
-    print(f"   📁 Total: {len(audio_files)}")
+    print(f"   📁 Total files: {len(audio_files)}")
     
     if dry_run:
         print(f"\n💡 This was a DRY RUN. Run without --dry-run to actually organize files.")
@@ -659,6 +685,12 @@ Examples:
         help='Process all files, even if already organized'
     )
     
+    parser.add_argument(
+        '--quiet', '-q',
+        action='store_true',
+        help='Minimal output, show progress every 50 files'
+    )
+    
     args = parser.parse_args()
     
     folder_path = Path(args.folder).resolve()
@@ -673,7 +705,7 @@ Examples:
         sys.exit(1)
     
     # Run organizer
-    organize_music(folder_path, args.dry_run, args.verbose, skip_organized=not args.no_skip)
+    organize_music(folder_path, args.dry_run, args.verbose, skip_organized=not args.no_skip, quiet=args.quiet)
 
 
 if __name__ == "__main__":
