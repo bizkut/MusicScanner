@@ -39,9 +39,9 @@ load_dotenv()
 # Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPPORTED_FORMATS = {'.mp3', '.flac', '.wav', '.m4a', '.aac', '.ogg', '.wma', '.opus'}
-API_RATE_LIMIT_DELAY = 0.5  # seconds between API calls
+API_RATE_LIMIT_DELAY = 1.0  # seconds between batch API calls
 SKIP_DIRECTORIES = {'.git', '.svn', '__pycache__', 'node_modules'}
-PROGRESS_INTERVAL = 50  # Print progress every N files in quiet mode
+BATCH_SIZE = 10  # Number of files to identify per API call
 
 # Initialize Gemini
 if GEMINI_API_KEY:
@@ -231,45 +231,65 @@ def extract_metadata(file_path: Path) -> Dict[str, Optional[str]]:
     return metadata
 
 
-def identify_with_gemini(filename: str, existing_metadata: Dict[str, Optional[str]], 
-                         cache: Optional[GeminiCache] = None) -> Dict[str, Any]:
-    """Use Gemini API to identify song, artist, album, and detect compilations."""
+def identify_batch_with_gemini(files_data: List[Dict[str, Any]], 
+                                cache: Optional[GeminiCache] = None,
+                                quiet: bool = False) -> Dict[str, Dict[str, Any]]:
+    """
+    Batch identify multiple files with a single Gemini API call.
+    Returns dict mapping filename to identified metadata.
+    """
+    results: Dict[str, Dict[str, Any]] = {}
+    uncached_files: List[Dict[str, Any]] = []
     
-    # Create cache key from filename and existing metadata
-    cache_key = f"{filename}|{existing_metadata.get('artist')}|{existing_metadata.get('album')}"
+    # Check cache first for each file
+    for file_data in files_data:
+        filename = file_data['filename']
+        metadata = file_data['metadata']
+        cache_key = f"{filename}|{metadata.get('artist')}|{metadata.get('album')}"
+        
+        if cache:
+            cached = cache.get(cache_key)
+            if cached:
+                results[filename] = cached
+                continue
+        
+        uncached_files.append(file_data)
     
-    # Check cache first
-    if cache:
-        cached = cache.get(cache_key)
-        if cached:
-            return cached
+    if not uncached_files:
+        return results
     
-    # Build context for Gemini
-    context_parts = [f"Filename: {filename}"]
-    if existing_metadata.get('artist'):
-        context_parts.append(f"Known Track Artist: {existing_metadata['artist']}")
-    if existing_metadata.get('album_artist'):
-        context_parts.append(f"Known Album Artist: {existing_metadata['album_artist']}")
-    if existing_metadata.get('album'):
-        context_parts.append(f"Known Album: {existing_metadata['album']}")
-    if existing_metadata.get('title'):
-        context_parts.append(f"Known Title: {existing_metadata['title']}")
+    # Build batch context
+    files_context = []
+    for i, file_data in enumerate(uncached_files, 1):
+        filename = file_data['filename']
+        metadata = file_data['metadata']
+        
+        parts = [f"File {i}: {filename}"]
+        if metadata.get('artist'):
+            parts.append(f"  Artist: {metadata['artist']}")
+        if metadata.get('album'):
+            parts.append(f"  Album: {metadata['album']}")
+        if metadata.get('title'):
+            parts.append(f"  Title: {metadata['title']}")
+        files_context.append("\n".join(parts))
     
-    context = "\n".join(context_parts)
+    batch_context = "\n\n".join(files_context)
     
-    prompt = f"""Analyze this music file and identify the track artist, album artist, album, and song title.
+    prompt = f"""Analyze these {len(uncached_files)} music files and identify the track artist, album artist, album, and song title for each.
 
-{context}
+{batch_context}
 
-IMPORTANT: Determine if this is a COMPILATION album (soundtracks, "Various Artists", "Now That's What I Call Music", etc.)
-- For regular albums: album_artist should be the same as artist
-- For compilations: album_artist should be "Various Artists"
+IMPORTANT: Determine if each is a COMPILATION album (soundtracks, "Various Artists", etc.)
+- For regular albums: album_artist = artist
+- For compilations: album_artist = "Various Artists"
 
-Respond ONLY with a valid JSON object in this exact format (no markdown, no explanation):
-{{"artist": "Track Artist Name", "album_artist": "Album Artist or Various Artists", "album": "Album Name", "title": "Song Title", "is_compilation": true/false}}
+Respond with a JSON array of objects, one per file, in order:
+[
+  {{"file": 1, "artist": "...", "album_artist": "...", "album": "...", "title": "...", "is_compilation": false}},
+  {{"file": 2, "artist": "...", "album_artist": "...", "album": "...", "title": "...", "is_compilation": false}}
+]
 
-If you cannot determine a field with confidence, use "Unknown" for that field.
-For the album, if you're not sure, you can use "Singles".
+Use "Unknown" for fields you can't determine. No markdown, just the JSON array.
 """
 
     response_text = ""
@@ -278,46 +298,71 @@ For the album, if you're not sure, you can use "Singles".
         response = model.generate_content(prompt)
         response_text = response.text.strip()
         
-        # Rate limiting AFTER successful call
+        # Rate limiting after call
         time.sleep(API_RATE_LIMIT_DELAY)
         
-        # Clean up response - remove markdown code blocks if present
+        # Clean up response
         if response_text.startswith('```'):
             response_text = re.sub(r'^```(?:json)?\s*', '', response_text)
             response_text = re.sub(r'\s*```$', '', response_text)
         
-        result = json.loads(response_text)
-        identified: Dict[str, Any] = {
-            'artist': sanitize_filename(result.get('artist', 'Unknown Artist')),
-            'album_artist': sanitize_filename(result.get('album_artist', result.get('artist', 'Unknown Artist'))),
-            'album': sanitize_filename(result.get('album', 'Unknown Album')),
-            'title': sanitize_filename(result.get('title', 'Unknown Title')),
-            'is_compilation': result.get('is_compilation', False)
-        }
+        batch_results = json.loads(response_text)
         
-        # Cache the result
-        if cache:
-            cache.set(cache_key, identified)
+        # Map results back to filenames
+        for i, file_data in enumerate(uncached_files):
+            filename = file_data['filename']
+            metadata = file_data['metadata']
+            
+            if i < len(batch_results):
+                result = batch_results[i]
+                identified: Dict[str, Any] = {
+                    'artist': sanitize_filename(result.get('artist', 'Unknown Artist')),
+                    'album_artist': sanitize_filename(result.get('album_artist', result.get('artist', 'Unknown Artist'))),
+                    'album': sanitize_filename(result.get('album', 'Unknown Album')),
+                    'title': sanitize_filename(result.get('title', 'Unknown Title')),
+                    'is_compilation': result.get('is_compilation', False)
+                }
+            else:
+                # Fallback if response is incomplete
+                artist = metadata.get('artist') or 'Unknown Artist'
+                identified = {
+                    'artist': artist,
+                    'album_artist': metadata.get('album_artist') or artist,
+                    'album': metadata.get('album') or 'Unknown Album',
+                    'title': metadata.get('title') or Path(filename).stem,
+                    'is_compilation': False
+                }
+            
+            results[filename] = identified
+            
+            # Cache result
+            if cache:
+                cache_key = f"{filename}|{metadata.get('artist')}|{metadata.get('album')}"
+                cache.set(cache_key, identified)
         
-        return identified
+        return results
         
     except json.JSONDecodeError as e:
-        response_preview = response_text[:200] if response_text else 'N/A'
-        print(f"  Warning: Could not parse Gemini response for {filename}: {e}")
-        print(f"  Response was: {response_preview}")
+        if not quiet:
+            print(f"  Warning: Could not parse batch Gemini response: {e}")
     except Exception as e:
-        print(f"  Warning: Gemini API error for {filename}: {e}")
+        if not quiet:
+            print(f"  Warning: Gemini batch API error: {e}")
     
-    # Fallback to existing metadata or filename
-    artist = existing_metadata.get('artist') or 'Unknown Artist'
-    fallback: Dict[str, Any] = {
-        'artist': artist,
-        'album_artist': existing_metadata.get('album_artist') or artist,
-        'album': existing_metadata.get('album') or 'Unknown Album',
-        'title': existing_metadata.get('title') or Path(filename).stem,
-        'is_compilation': False
-    }
-    return fallback
+    # Fallback for all files in batch
+    for file_data in uncached_files:
+        filename = file_data['filename']
+        metadata = file_data['metadata']
+        artist = metadata.get('artist') or 'Unknown Artist'
+        results[filename] = {
+            'artist': artist,
+            'album_artist': metadata.get('album_artist') or artist,
+            'album': metadata.get('album') or 'Unknown Album',
+            'title': metadata.get('title') or Path(filename).stem,
+            'is_compilation': False
+        }
+    
+    return results
 
 
 def is_compilation(metadata: Dict[str, Optional[str]], identified: Dict[str, Any]) -> bool:
@@ -532,56 +577,118 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
     successful = 0
     failed = 0
     skipped = 0
-    current_album = None  # Track current album for progress output
+    current_album = None
     albums_processed = 0
     
-    # Process each file
+    # First pass: collect file data and identify which need API calls
+    print("📋 Analyzing files...")
+    files_to_process: List[Dict[str, Any]] = []
+    files_needing_api: List[Dict[str, Any]] = []
+    
     total_files = len(audio_files)
     for i, file_path in enumerate(audio_files, 1):
+        # Skip already organized files
+        if skip_organized and is_already_organized(file_path, folder_path):
+            if verbose:
+                print(f"  ⏭️  {file_path.name} - already organized")
+            logger.log_skip(file_path, "Already organized")
+            skipped += 1
+            continue
+        
+        # Extract metadata
+        metadata = extract_metadata(file_path)
+        
+        file_data = {
+            'file_path': file_path,
+            'filename': file_path.name,
+            'metadata': metadata,
+            'identified': None
+        }
+        
+        # Check if we need Gemini
+        has_metadata = all([
+            metadata.get('artist'),
+            metadata.get('album'),
+            metadata.get('title')
+        ])
+        
+        if has_metadata:
+            # Use existing metadata
+            artist = sanitize_filename(metadata['artist'] or 'Unknown Artist')
+            album_artist = sanitize_filename(metadata.get('album_artist') or metadata['artist'] or 'Unknown Artist')
+            file_data['identified'] = {
+                'artist': artist,
+                'album_artist': album_artist,
+                'album': sanitize_filename(metadata['album'] or 'Unknown Album'),
+                'title': sanitize_filename(metadata['title'] or 'Unknown Title'),
+                'is_compilation': False
+            }
+        else:
+            files_needing_api.append(file_data)
+        
+        files_to_process.append(file_data)
+    
+    print(f"   {len(files_to_process)} files to organize, {len(files_needing_api)} need AI identification\n")
+    
+    # Second pass: batch identify files needing API
+    if files_needing_api:
+        print(f"🤖 Identifying {len(files_needing_api)} files with Gemini AI (batch size: {BATCH_SIZE})...")
+        
+        for batch_start in range(0, len(files_needing_api), BATCH_SIZE):
+            batch = files_needing_api[batch_start:batch_start + BATCH_SIZE]
+            batch_end = min(batch_start + BATCH_SIZE, len(files_needing_api))
+            
+            if not quiet:
+                print(f"   Batch {batch_start//BATCH_SIZE + 1}: files {batch_start + 1}-{batch_end}")
+            
+            # Call batch API
+            batch_results = identify_batch_with_gemini(batch, cache, quiet)
+            
+            # Update file data with results
+            for file_data in batch:
+                filename = file_data['filename']
+                if filename in batch_results:
+                    file_data['identified'] = batch_results[filename]
+                else:
+                    # Fallback
+                    metadata = file_data['metadata']
+                    artist = metadata.get('artist') or 'Unknown Artist'
+                    file_data['identified'] = {
+                        'artist': artist,
+                        'album_artist': metadata.get('album_artist') or artist,
+                        'album': metadata.get('album') or 'Unknown Album',
+                        'title': metadata.get('title') or Path(filename).stem,
+                        'is_compilation': False
+                    }
+        
+        print()
+    
+    # Third pass: process all files
+    print("📁 Organizing files...")
+    for i, file_data in enumerate(files_to_process, 1):
+        file_path = file_data['file_path']
+        metadata = file_data['metadata']
+        identified = file_data['identified']
+        
+        if identified is None:
+            # This shouldn't happen, but fallback just in case
+            artist = metadata.get('artist') or 'Unknown Artist'
+            identified = {
+                'artist': artist,
+                'album_artist': metadata.get('album_artist') or artist,
+                'album': metadata.get('album') or 'Unknown Album',
+                'title': metadata.get('title') or file_path.stem,
+                'is_compilation': False
+            }
+        
         try:
-            # Resume support: skip already organized files
-            if skip_organized and is_already_organized(file_path, folder_path):
-                if verbose:
-                    print(f"  ⏭️  Already in organized structure, skipping")
-                logger.log_skip(file_path, "Already organized")
-                skipped += 1
-                continue
-            
-            # Extract existing metadata
-            metadata = extract_metadata(file_path)
-            
-            # Check if we need Gemini (missing critical metadata)
-            needs_identification = not all([
-                metadata.get('artist'),
-                metadata.get('album'),
-                metadata.get('title')
-            ])
-            
-            if needs_identification:
-                if verbose:
-                    print(f"  📡 Querying Gemini API...")
-                identified = identify_with_gemini(file_path.name, metadata, cache)
-            else:
-                # Use existing metadata
-                artist = sanitize_filename(metadata['artist'] or 'Unknown Artist')
-                album_artist = sanitize_filename(metadata.get('album_artist') or metadata['artist'] or 'Unknown Artist')
-                identified: Dict[str, Any] = {
-                    'artist': artist,
-                    'album_artist': album_artist,
-                    'album': sanitize_filename(metadata['album'] or 'Unknown Album'),
-                    'title': sanitize_filename(metadata['title'] or 'Unknown Title'),
-                    'is_compilation': False
-                }
-            
             # Progress output: print when album changes
             album_key = f"{identified.get('album_artist', identified['artist'])}/{identified['album']}"
             if album_key != current_album:
                 current_album = album_key
                 albums_processed += 1
                 if not quiet:
-                    print(f"[{i}/{total_files}] 💿 {album_key}")
-                elif verbose:
-                    print(f"[{i}/{total_files}] Processing album: {album_key}")
+                    print(f"[{i}/{len(files_to_process)}] 💿 {album_key}")
             
             if verbose:
                 print(f"  → {file_path.name}")
