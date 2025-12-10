@@ -3,6 +3,7 @@
 Music Organizer Script
 Scans a music folder, identifies songs/albums/artists using Gemini API,
 and reorganizes them into Artist/Album/Song folder structure in-place.
+Properly handles compilation albums with Various Artists.
 """
 
 import os
@@ -48,6 +49,7 @@ def extract_metadata(file_path: Path) -> Dict[str, Optional[str]]:
     """Extract metadata from audio file using mutagen."""
     metadata = {
         'artist': None,
+        'album_artist': None,  # For compilations
         'album': None,
         'title': None,
         'track_number': None
@@ -61,6 +63,8 @@ def extract_metadata(file_path: Path) -> Dict[str, Optional[str]]:
         # Try to get metadata
         if 'artist' in audio:
             metadata['artist'] = audio['artist'][0] if audio['artist'] else None
+        if 'albumartist' in audio:
+            metadata['album_artist'] = audio['albumartist'][0] if audio['albumartist'] else None
         if 'album' in audio:
             metadata['album'] = audio['album'][0] if audio['album'] else None
         if 'title' in audio:
@@ -77,12 +81,14 @@ def extract_metadata(file_path: Path) -> Dict[str, Optional[str]]:
 
 
 def identify_with_gemini(filename: str, existing_metadata: Dict[str, Optional[str]]) -> Dict[str, str]:
-    """Use Gemini API to identify song, artist, and album from filename and partial metadata."""
+    """Use Gemini API to identify song, artist, album, and detect compilations."""
     
     # Build context for Gemini
     context_parts = [f"Filename: {filename}"]
     if existing_metadata.get('artist'):
-        context_parts.append(f"Known Artist: {existing_metadata['artist']}")
+        context_parts.append(f"Known Track Artist: {existing_metadata['artist']}")
+    if existing_metadata.get('album_artist'):
+        context_parts.append(f"Known Album Artist: {existing_metadata['album_artist']}")
     if existing_metadata.get('album'):
         context_parts.append(f"Known Album: {existing_metadata['album']}")
     if existing_metadata.get('title'):
@@ -90,16 +96,19 @@ def identify_with_gemini(filename: str, existing_metadata: Dict[str, Optional[st
     
     context = "\n".join(context_parts)
     
-    prompt = f"""Analyze this music file and identify the artist, album, and song title.
-If information is already provided, validate and use it. If not, try to identify from the filename.
+    prompt = f"""Analyze this music file and identify the track artist, album artist, album, and song title.
 
 {context}
 
+IMPORTANT: Determine if this is a COMPILATION album (soundtracks, "Various Artists", "Now That's What I Call Music", etc.)
+- For regular albums: album_artist should be the same as artist
+- For compilations: album_artist should be "Various Artists"
+
 Respond ONLY with a valid JSON object in this exact format (no markdown, no explanation):
-{{"artist": "Artist Name", "album": "Album Name", "title": "Song Title"}}
+{{"artist": "Track Artist Name", "album_artist": "Album Artist or Various Artists", "album": "Album Name", "title": "Song Title", "is_compilation": true/false}}
 
 If you cannot determine a field with confidence, use "Unknown" for that field.
-For the album, if you're not sure, you can use "Singles" or the artist's name.
+For the album, if you're not sure, you can use "Singles".
 """
 
     try:
@@ -115,8 +124,10 @@ For the album, if you're not sure, you can use "Singles" or the artist's name.
         result = json.loads(response_text)
         return {
             'artist': sanitize_filename(result.get('artist', 'Unknown Artist')),
+            'album_artist': sanitize_filename(result.get('album_artist', result.get('artist', 'Unknown Artist'))),
             'album': sanitize_filename(result.get('album', 'Unknown Album')),
-            'title': sanitize_filename(result.get('title', 'Unknown Title'))
+            'title': sanitize_filename(result.get('title', 'Unknown Title')),
+            'is_compilation': result.get('is_compilation', False)
         }
     except json.JSONDecodeError as e:
         print(f"  Warning: Could not parse Gemini response for {filename}: {e}")
@@ -125,11 +136,34 @@ For the album, if you're not sure, you can use "Singles" or the artist's name.
         print(f"  Warning: Gemini API error for {filename}: {e}")
     
     # Fallback to existing metadata or filename
+    artist = existing_metadata.get('artist') or 'Unknown Artist'
     return {
-        'artist': existing_metadata.get('artist') or 'Unknown Artist',
+        'artist': artist,
+        'album_artist': existing_metadata.get('album_artist') or artist,
         'album': existing_metadata.get('album') or 'Unknown Album',
-        'title': existing_metadata.get('title') or Path(filename).stem
+        'title': existing_metadata.get('title') or Path(filename).stem,
+        'is_compilation': False
     }
+
+
+def is_compilation(metadata: Dict, identified: Dict) -> bool:
+    """Detect if this is a compilation album."""
+    # Check if Gemini identified it as compilation
+    if identified.get('is_compilation'):
+        return True
+    
+    # Check album_artist tag
+    album_artist = metadata.get('album_artist') or identified.get('album_artist', '')
+    if album_artist.lower() in ['various artists', 'various', 'va', 'soundtrack', 'ost']:
+        return True
+    
+    # Check if album_artist differs from track artist
+    if metadata.get('album_artist') and metadata.get('artist'):
+        if metadata['album_artist'].lower() != metadata['artist'].lower():
+            if 'various' in metadata['album_artist'].lower():
+                return True
+    
+    return False
 
 
 def scan_music_folder(folder_path: Path) -> List[Path]:
@@ -192,26 +226,48 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
                     print(f"  📡 Querying Gemini API...")
                 identified = identify_with_gemini(file_path.name, metadata)
             else:
+                # Use existing metadata
+                artist = sanitize_filename(metadata['artist'])
+                album_artist = sanitize_filename(metadata.get('album_artist') or metadata['artist'])
                 identified = {
-                    'artist': sanitize_filename(metadata['artist']),
+                    'artist': artist,
+                    'album_artist': album_artist,
                     'album': sanitize_filename(metadata['album']),
-                    'title': sanitize_filename(metadata['title'])
+                    'title': sanitize_filename(metadata['title']),
+                    'is_compilation': False
                 }
             
-            # Build destination path (within the same folder)
-            artist_folder = folder_path / identified['artist']
+            # Detect if this is a compilation
+            is_comp = is_compilation(metadata, identified)
+            
+            # Use album_artist for folder (handles compilations properly)
+            if is_comp:
+                folder_artist = "Various Artists"
+            else:
+                folder_artist = identified.get('album_artist') or identified['artist']
+            
+            # Build destination path
+            artist_folder = folder_path / folder_artist
             album_folder = artist_folder / identified['album']
             
-            # Build new filename: TrackNum - Title (Artist/Album already in folder path)
+            # Build new filename
             track_num = metadata.get('track_number') or "00"
-            new_filename = f"{track_num} - {identified['title']}{file_path.suffix.lower()}"
+            
+            if is_comp:
+                # For compilations: include track artist in filename
+                new_filename = f"{track_num} - {identified['artist']} - {identified['title']}{file_path.suffix.lower()}"
+            else:
+                # For regular albums: just track number and title
+                new_filename = f"{track_num} - {identified['title']}{file_path.suffix.lower()}"
             
             dest_path = album_folder / new_filename
             
             if verbose:
                 print(f"  → Artist: {identified['artist']}")
+                print(f"  → Album Artist: {folder_artist}")
                 print(f"  → Album: {identified['album']}")
                 print(f"  → Title: {identified['title']}")
+                print(f"  → Compilation: {'Yes' if is_comp else 'No'}")
                 print(f"  → Destination: {dest_path.relative_to(folder_path)}")
             
             # Skip if already in correct location
