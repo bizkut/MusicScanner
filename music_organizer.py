@@ -14,6 +14,7 @@ Features:
 - Resume support (skip already organized)
 - Rate limiting for API calls
 - Response caching to reduce API costs
+- Graceful interrupt handling
 """
 
 import os
@@ -23,9 +24,10 @@ import shutil
 import json
 import re
 import time
+import signal
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, Dict, List, Tuple
+from typing import Optional, Dict, List, Tuple, Any
 
 from dotenv import load_dotenv
 import google.generativeai as genai
@@ -38,10 +40,36 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 SUPPORTED_FORMATS = {'.mp3', '.flac', '.wav', '.m4a', '.aac', '.ogg', '.wma', '.opus'}
 API_RATE_LIMIT_DELAY = 0.5  # seconds between API calls
+SKIP_DIRECTORIES = {'.git', '.svn', '__pycache__', 'node_modules', '.DS_Store'}
 
 # Initialize Gemini
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
+# Global logger for interrupt handling
+_current_logger: Optional['ChangeLogger'] = None
+_current_log_file: Optional[Path] = None
+_current_undo_script: Optional[Path] = None
+
+
+def signal_handler(signum, frame):
+    """Handle Ctrl+C gracefully - save logs before exit."""
+    print("\n\n⚠️  Interrupted! Saving progress...")
+    if _current_logger and _current_log_file:
+        try:
+            _current_logger.save()
+            print(f"📝 Partial log saved: {_current_log_file.name}")
+            if _current_undo_script:
+                _current_logger.generate_undo_script(_current_undo_script)
+                print(f"↩️  Partial undo script saved: {_current_undo_script.name}")
+        except Exception as e:
+            print(f"❌ Could not save logs: {e}")
+    sys.exit(1)
+
+
+# Register signal handler
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 
 class GeminiCache:
@@ -49,7 +77,7 @@ class GeminiCache:
     
     def __init__(self, cache_file: Path):
         self.cache_file = cache_file
-        self.cache: Dict[str, Dict] = {}
+        self.cache: Dict[str, Dict[str, Any]] = {}
         self._load()
     
     def _load(self):
@@ -58,7 +86,7 @@ class GeminiCache:
             try:
                 with open(self.cache_file, 'r', encoding='utf-8') as f:
                     self.cache = json.load(f)
-            except:
+            except Exception:
                 self.cache = {}
     
     def _save(self):
@@ -66,14 +94,14 @@ class GeminiCache:
         try:
             with open(self.cache_file, 'w', encoding='utf-8') as f:
                 json.dump(self.cache, f, indent=2, ensure_ascii=False)
-        except:
+        except Exception:
             pass
     
-    def get(self, key: str) -> Optional[Dict]:
+    def get(self, key: str) -> Optional[Dict[str, Any]]:
         """Get cached response."""
         return self.cache.get(key)
     
-    def set(self, key: str, value: Dict):
+    def set(self, key: str, value: Dict[str, Any]):
         """Cache a response."""
         self.cache[key] = value
         self._save()
@@ -84,10 +112,10 @@ class ChangeLogger:
     
     def __init__(self, log_file: Path):
         self.log_file = log_file
-        self.changes: List[Dict] = []
+        self.changes: List[Dict[str, Any]] = []
         self.start_time = datetime.now().isoformat()
     
-    def log_move(self, source: Path, dest: Path, metadata: Dict):
+    def log_move(self, source: Path, dest: Path, metadata: Dict[str, Any]):
         """Log a file move operation."""
         self.changes.append({
             'action': 'move',
@@ -169,7 +197,7 @@ def sanitize_filename(name: str) -> str:
 
 def extract_metadata(file_path: Path) -> Dict[str, Optional[str]]:
     """Extract metadata from audio file using mutagen."""
-    metadata = {
+    metadata: Dict[str, Optional[str]] = {
         'artist': None,
         'album_artist': None,
         'album': None,
@@ -203,7 +231,7 @@ def extract_metadata(file_path: Path) -> Dict[str, Optional[str]]:
 
 
 def identify_with_gemini(filename: str, existing_metadata: Dict[str, Optional[str]], 
-                         cache: Optional[GeminiCache] = None) -> Dict[str, str]:
+                         cache: Optional[GeminiCache] = None) -> Dict[str, Any]:
     """Use Gemini API to identify song, artist, album, and detect compilations."""
     
     # Create cache key from filename and existing metadata
@@ -243,13 +271,14 @@ If you cannot determine a field with confidence, use "Unknown" for that field.
 For the album, if you're not sure, you can use "Singles".
 """
 
+    response_text = ""
     try:
-        # Rate limiting
-        time.sleep(API_RATE_LIMIT_DELAY)
-        
         model = genai.GenerativeModel('gemini-2.0-flash-exp')
         response = model.generate_content(prompt)
         response_text = response.text.strip()
+        
+        # Rate limiting AFTER successful call
+        time.sleep(API_RATE_LIMIT_DELAY)
         
         # Clean up response - remove markdown code blocks if present
         if response_text.startswith('```'):
@@ -257,7 +286,7 @@ For the album, if you're not sure, you can use "Singles".
             response_text = re.sub(r'\s*```$', '', response_text)
         
         result = json.loads(response_text)
-        identified = {
+        identified: Dict[str, Any] = {
             'artist': sanitize_filename(result.get('artist', 'Unknown Artist')),
             'album_artist': sanitize_filename(result.get('album_artist', result.get('artist', 'Unknown Artist'))),
             'album': sanitize_filename(result.get('album', 'Unknown Album')),
@@ -272,7 +301,7 @@ For the album, if you're not sure, you can use "Singles".
         return identified
         
     except json.JSONDecodeError as e:
-        response_preview = response_text[:200] if 'response_text' in locals() else 'N/A'
+        response_preview = response_text[:200] if response_text else 'N/A'
         print(f"  Warning: Could not parse Gemini response for {filename}: {e}")
         print(f"  Response was: {response_preview}")
     except Exception as e:
@@ -280,7 +309,7 @@ For the album, if you're not sure, you can use "Singles".
     
     # Fallback to existing metadata or filename
     artist = existing_metadata.get('artist') or 'Unknown Artist'
-    fallback = {
+    fallback: Dict[str, Any] = {
         'artist': artist,
         'album_artist': existing_metadata.get('album_artist') or artist,
         'album': existing_metadata.get('album') or 'Unknown Album',
@@ -290,7 +319,7 @@ For the album, if you're not sure, you can use "Singles".
     return fallback
 
 
-def is_compilation(metadata: Dict, identified: Dict) -> bool:
+def is_compilation(metadata: Dict[str, Optional[str]], identified: Dict[str, Any]) -> bool:
     """Detect if this is a compilation album."""
     # Check if Gemini identified it as compilation
     if identified.get('is_compilation'):
@@ -298,7 +327,7 @@ def is_compilation(metadata: Dict, identified: Dict) -> bool:
     
     # Check album_artist tag
     album_artist = metadata.get('album_artist') or identified.get('album_artist', '')
-    if album_artist.lower() in ['various artists', 'various', 'va', 'soundtrack', 'ost']:
+    if album_artist and album_artist.lower() in ['various artists', 'various', 'va', 'soundtrack', 'ost']:
         return True
     
     # Check if album_artist differs from track artist
@@ -311,11 +340,17 @@ def is_compilation(metadata: Dict, identified: Dict) -> bool:
 
 
 def scan_music_folder(folder_path: Path) -> List[Path]:
-    """Recursively scan folder for audio files."""
-    audio_files = []
+    """Recursively scan folder for audio files, skipping hidden/system directories."""
+    audio_files: List[Path] = []
     
     for root, dirs, files in os.walk(folder_path):
+        # Skip hidden and system directories
+        dirs[:] = [d for d in dirs if not d.startswith('.') and d not in SKIP_DIRECTORIES]
+        
         for file in files:
+            # Skip hidden files
+            if file.startswith('.'):
+                continue
             file_path = Path(root) / file
             if file_path.suffix.lower() in SUPPORTED_FORMATS:
                 audio_files.append(file_path)
@@ -324,14 +359,133 @@ def scan_music_folder(folder_path: Path) -> List[Path]:
 
 
 def is_already_organized(file_path: Path, folder_path: Path) -> bool:
-    """Check if file is already in Artist/Album structure."""
+    """Check if file is already in Artist/Album structure with valid naming."""
     try:
         relative = file_path.relative_to(folder_path)
         parts = relative.parts
-        # If file is in Artist/Album/file.mp3 structure (depth of 3)
-        return len(parts) == 3
-    except:
+        
+        # Must be in Artist/Album/file.mp3 structure (depth of 3)
+        if len(parts) != 3:
+            return False
+        
+        artist_folder, album_folder, filename = parts
+        
+        # Check that folders are not empty/placeholder names
+        if artist_folder in ('', '.', '..', 'Unknown', 'Unknown Artist'):
+            return False
+        if album_folder in ('', '.', '..', 'Unknown', 'Unknown Album'):
+            return False
+        
+        # Check filename follows pattern: "NN - Title.ext" or "NN - Artist - Title.ext"
+        if not re.match(r'^\d{2}\s*-\s*.+\..+$', filename):
+            return False
+        
+        return True
+    except Exception:
         return False
+
+
+def process_file(file_path: Path, folder_path: Path, metadata: Dict[str, Optional[str]],
+                 identified: Dict[str, Any], dry_run: bool, verbose: bool,
+                 logger: ChangeLogger) -> Tuple[str, Optional[Path]]:
+    """
+    Process a single file for organization.
+    Returns: (status, dest_path) where status is 'success', 'skip', or 'error'
+    """
+    # Detect if this is a compilation
+    is_comp = is_compilation(metadata, identified)
+    
+    # Use album_artist for folder (handles compilations properly)
+    if is_comp:
+        folder_artist = "Various Artists"
+    else:
+        folder_artist = identified.get('album_artist') or identified['artist']
+    
+    # Build destination path
+    artist_folder = folder_path / folder_artist
+    album_folder = artist_folder / identified['album']
+    
+    # Build new filename
+    track_num = metadata.get('track_number') or "00"
+    
+    if is_comp:
+        # For compilations: include track artist in filename
+        new_filename = f"{track_num} - {identified['artist']} - {identified['title']}{file_path.suffix.lower()}"
+    else:
+        # For regular albums: just track number and title
+        new_filename = f"{track_num} - {identified['title']}{file_path.suffix.lower()}"
+    
+    dest_path = album_folder / new_filename
+    
+    if verbose:
+        print(f"  → Artist: {identified['artist']}")
+        print(f"  → Album Artist: {folder_artist}")
+        print(f"  → Album: {identified['album']}")
+        print(f"  → Title: {identified['title']}")
+        print(f"  → Compilation: {'Yes' if is_comp else 'No'}")
+        print(f"  → Destination: {dest_path.relative_to(folder_path)}")
+    
+    # Skip if already in correct location (compare normalized string paths)
+    source_normalized = str(file_path.resolve()).lower()
+    dest_normalized = str((album_folder / new_filename).resolve()).lower()
+    
+    if source_normalized == dest_normalized:
+        print(f"  ⏭️  Already organized")
+        logger.log_skip(file_path, "Already at destination")
+        return 'skip', None
+    
+    # Handle duplicates
+    if dest_path.exists():
+        counter = 1
+        stem = dest_path.stem
+        while dest_path.exists():
+            new_name = f"{stem} ({counter}){dest_path.suffix}"
+            dest_path = dest_path.parent / new_name
+            counter += 1
+    
+    if not dry_run:
+        # Create directories
+        album_folder.mkdir(parents=True, exist_ok=True)
+        
+        # SAFE MOVE: Copy first, verify, then delete original
+        # Step 1: Copy file to destination
+        shutil.copy2(str(file_path), str(dest_path))
+        
+        # Step 2: Verify copy succeeded (check file exists and size matches)
+        if dest_path.exists() and dest_path.stat().st_size == file_path.stat().st_size:
+            # Step 3: Only delete original after verified copy
+            file_path.unlink()
+            print(f"  ✅ Moved to: {dest_path.relative_to(folder_path)}")
+            logger.log_move(file_path, dest_path, identified)
+            return 'success', dest_path
+        else:
+            # Copy failed - remove incomplete copy, keep original
+            if dest_path.exists():
+                dest_path.unlink()
+            print(f"  ⚠️  Copy verification failed, original kept safe")
+            logger.log_error(file_path, "Copy verification failed")
+            return 'error', None
+    else:
+        print(f"  🔍 Would move to: {dest_path.relative_to(folder_path)}")
+        return 'success', dest_path
+
+
+def cleanup_empty_directories(folder_path: Path, verbose: bool = False):
+    """Remove empty directories after organization."""
+    print("\n🧹 Cleaning up empty directories...")
+    for root, dirs, files in os.walk(folder_path, topdown=False):
+        # Skip hidden directories
+        dirs[:] = [d for d in dirs if not d.startswith('.')]
+        
+        for dir_name in dirs:
+            dir_path = Path(root) / dir_name
+            try:
+                if dir_path.exists() and not any(dir_path.iterdir()):
+                    dir_path.rmdir()
+                    if verbose:
+                        print(f"   Removed empty: {dir_path.relative_to(folder_path)}")
+            except Exception:
+                pass
 
 
 def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = False,
@@ -340,17 +494,27 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
     Main function to organize music files in-place.
     Returns tuple of (successful_count, failed_count)
     """
+    global _current_logger, _current_log_file, _current_undo_script
+    
     if not GEMINI_API_KEY:
         print("Error: GEMINI_API_KEY not found in .env file")
         sys.exit(1)
     
+    # Use single timestamp for all files
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    
     # Initialize cache and logger
     cache_file = folder_path / '.music_organizer_cache.json'
-    log_file = folder_path / f'.music_organizer_log_{datetime.now().strftime("%Y%m%d_%H%M%S")}.json'
-    undo_script = folder_path / f'undo_organize_{datetime.now().strftime("%Y%m%d_%H%M%S")}.sh'
+    log_file = folder_path / f'.music_organizer_log_{timestamp}.json'
+    undo_script = folder_path / f'undo_organize_{timestamp}.sh'
     
     cache = GeminiCache(cache_file)
     logger = ChangeLogger(log_file)
+    
+    # Set global references for interrupt handler
+    _current_logger = logger
+    _current_log_file = log_file
+    _current_undo_script = undo_script
     
     print(f"\n🎵 Music Organizer")
     print(f"{'='*50}")
@@ -400,91 +564,26 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
                 identified = identify_with_gemini(file_path.name, metadata, cache)
             else:
                 # Use existing metadata
-                artist = sanitize_filename(metadata['artist'])
-                album_artist = sanitize_filename(metadata.get('album_artist') or metadata['artist'])
-                identified = {
+                artist = sanitize_filename(metadata['artist'] or 'Unknown Artist')
+                album_artist = sanitize_filename(metadata.get('album_artist') or metadata['artist'] or 'Unknown Artist')
+                identified: Dict[str, Any] = {
                     'artist': artist,
                     'album_artist': album_artist,
-                    'album': sanitize_filename(metadata['album']),
-                    'title': sanitize_filename(metadata['title']),
+                    'album': sanitize_filename(metadata['album'] or 'Unknown Album'),
+                    'title': sanitize_filename(metadata['title'] or 'Unknown Title'),
                     'is_compilation': False
                 }
             
-            # Detect if this is a compilation
-            is_comp = is_compilation(metadata, identified)
+            # Process the file
+            status, dest = process_file(file_path, folder_path, metadata, identified,
+                                        dry_run, verbose, logger)
             
-            # Use album_artist for folder (handles compilations properly)
-            if is_comp:
-                folder_artist = "Various Artists"
-            else:
-                folder_artist = identified.get('album_artist') or identified['artist']
-            
-            # Build destination path
-            artist_folder = folder_path / folder_artist
-            album_folder = artist_folder / identified['album']
-            
-            # Build new filename
-            track_num = metadata.get('track_number') or "00"
-            
-            if is_comp:
-                # For compilations: include track artist in filename
-                new_filename = f"{track_num} - {identified['artist']} - {identified['title']}{file_path.suffix.lower()}"
-            else:
-                # For regular albums: just track number and title
-                new_filename = f"{track_num} - {identified['title']}{file_path.suffix.lower()}"
-            
-            dest_path = album_folder / new_filename
-            
-            if verbose:
-                print(f"  → Artist: {identified['artist']}")
-                print(f"  → Album Artist: {folder_artist}")
-                print(f"  → Album: {identified['album']}")
-                print(f"  → Title: {identified['title']}")
-                print(f"  → Compilation: {'Yes' if is_comp else 'No'}")
-                print(f"  → Destination: {dest_path.relative_to(folder_path)}")
-            
-            # Skip if already in correct location (case-insensitive comparison)
-            if file_path.resolve() == dest_path.resolve():
-                print(f"  ⏭️  Already organized")
-                logger.log_skip(file_path, "Already at destination")
+            if status == 'success':
+                successful += 1
+            elif status == 'skip':
                 skipped += 1
-                continue
-            
-            # Handle duplicates
-            if dest_path.exists():
-                counter = 1
-                stem = dest_path.stem
-                while dest_path.exists():
-                    new_name = f"{stem} ({counter}){dest_path.suffix}"
-                    dest_path = dest_path.parent / new_name
-                    counter += 1
-            
-            if not dry_run:
-                # Create directories
-                album_folder.mkdir(parents=True, exist_ok=True)
-                
-                # SAFE MOVE: Copy first, verify, then delete original
-                # Step 1: Copy file to destination
-                shutil.copy2(str(file_path), str(dest_path))
-                
-                # Step 2: Verify copy succeeded (check file exists and size matches)
-                if dest_path.exists() and dest_path.stat().st_size == file_path.stat().st_size:
-                    # Step 3: Only delete original after verified copy
-                    file_path.unlink()
-                    print(f"  ✅ Moved to: {dest_path.relative_to(folder_path)}")
-                    logger.log_move(file_path, dest_path, identified)
-                else:
-                    # Copy failed - remove incomplete copy, keep original
-                    if dest_path.exists():
-                        dest_path.unlink()
-                    print(f"  ⚠️  Copy verification failed, original kept safe")
-                    logger.log_error(file_path, "Copy verification failed")
-                    failed += 1
-                    continue
             else:
-                print(f"  🔍 Would move to: {dest_path.relative_to(folder_path)}")
-            
-            successful += 1
+                failed += 1
             
         except Exception as e:
             print(f"  ❌ Error: {e}")
@@ -493,17 +592,7 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
     
     # Clean up empty directories
     if not dry_run:
-        print("\n🧹 Cleaning up empty directories...")
-        for root, dirs, files in os.walk(folder_path, topdown=False):
-            for dir_name in dirs:
-                dir_path = Path(root) / dir_name
-                try:
-                    if not any(dir_path.iterdir()):
-                        dir_path.rmdir()
-                        if verbose:
-                            print(f"   Removed empty: {dir_path.relative_to(folder_path)}")
-                except:
-                    pass
+        cleanup_empty_directories(folder_path, verbose)
     
     # Save logs and generate undo script
     if not dry_run:
@@ -511,6 +600,11 @@ def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = Fal
         logger.generate_undo_script(undo_script)
         print(f"\n📝 Change log saved: {log_file.name}")
         print(f"↩️  Undo script saved: {undo_script.name}")
+    
+    # Clear global references
+    _current_logger = None
+    _current_log_file = None
+    _current_undo_script = None
     
     # Summary
     print(f"\n{'='*50}")
