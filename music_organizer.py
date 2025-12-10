@@ -40,9 +40,9 @@ load_dotenv()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")  # Can override via .env
 SUPPORTED_FORMATS = {'.mp3', '.flac', '.wav', '.m4a', '.aac', '.ogg', '.wma', '.opus'}
-API_RATE_LIMIT_DELAY = 6.0  # seconds between batch API calls (10 req/min limit = 6s min)
+API_RATE_LIMIT_DELAY = 0.1  # seconds between batch API calls (2000 RPM = plenty of headroom)
 MAX_RETRIES = 3
-RETRY_BASE_DELAY = 10  # seconds, will exponentially increase
+RETRY_BASE_DELAY = 5  # seconds, will exponentially increase
 SKIP_DIRECTORIES = {'.git', '.svn', '__pycache__', 'node_modules'}
 BATCH_SIZE = 10  # Number of files to identify per API call
 
