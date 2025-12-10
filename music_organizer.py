@@ -2,7 +2,7 @@
 """
 Music Organizer Script
 Scans a music folder, identifies songs/albums/artists using Gemini API,
-and reorganizes them into Artist/Album/Song folder structure.
+and reorganizes them into Artist/Album/Song folder structure in-place.
 """
 
 import os
@@ -132,11 +132,11 @@ For the album, if you're not sure, you can use "Singles" or the artist's name.
     }
 
 
-def scan_music_folder(source_path: Path) -> List[Path]:
+def scan_music_folder(folder_path: Path) -> List[Path]:
     """Recursively scan folder for audio files."""
     audio_files = []
     
-    for root, dirs, files in os.walk(source_path):
+    for root, dirs, files in os.walk(folder_path):
         for file in files:
             file_path = Path(root) / file
             if file_path.suffix.lower() in SUPPORTED_FORMATS:
@@ -145,9 +145,9 @@ def scan_music_folder(source_path: Path) -> List[Path]:
     return audio_files
 
 
-def organize_music(source_path: Path, output_path: Path, dry_run: bool = False, verbose: bool = False) -> Tuple[int, int]:
+def organize_music(folder_path: Path, dry_run: bool = False, verbose: bool = False) -> Tuple[int, int]:
     """
-    Main function to organize music files.
+    Main function to organize music files in-place.
     Returns tuple of (successful_count, failed_count)
     """
     if not GEMINI_API_KEY:
@@ -156,14 +156,13 @@ def organize_music(source_path: Path, output_path: Path, dry_run: bool = False, 
     
     print(f"\n🎵 Music Organizer")
     print(f"{'='*50}")
-    print(f"Source: {source_path}")
-    print(f"Output: {output_path}")
+    print(f"Folder: {folder_path}")
     print(f"Mode: {'DRY RUN (no files will be moved)' if dry_run else 'LIVE'}")
     print(f"{'='*50}\n")
     
     # Scan for audio files
     print("📂 Scanning for audio files...")
-    audio_files = scan_music_folder(source_path)
+    audio_files = scan_music_folder(folder_path)
     print(f"   Found {len(audio_files)} audio files\n")
     
     if not audio_files:
@@ -199,8 +198,8 @@ def organize_music(source_path: Path, output_path: Path, dry_run: bool = False, 
                     'title': sanitize_filename(metadata['title'])
                 }
             
-            # Build destination path
-            artist_folder = output_path / identified['artist']
+            # Build destination path (within the same folder)
+            artist_folder = folder_path / identified['artist']
             album_folder = artist_folder / identified['album']
             
             # Build new filename
@@ -215,7 +214,13 @@ def organize_music(source_path: Path, output_path: Path, dry_run: bool = False, 
                 print(f"  → Artist: {identified['artist']}")
                 print(f"  → Album: {identified['album']}")
                 print(f"  → Title: {identified['title']}")
-                print(f"  → Destination: {dest_path}")
+                print(f"  → Destination: {dest_path.relative_to(folder_path)}")
+            
+            # Skip if already in correct location
+            if file_path == dest_path:
+                print(f"  ⏭️  Already organized")
+                successful += 1
+                continue
             
             # Handle duplicates
             if dest_path.exists():
@@ -229,17 +234,45 @@ def organize_music(source_path: Path, output_path: Path, dry_run: bool = False, 
             if not dry_run:
                 # Create directories
                 album_folder.mkdir(parents=True, exist_ok=True)
-                # Copy file (safer than move, user can delete source later)
-                shutil.copy2(file_path, dest_path)
-                print(f"  ✅ Copied to: {dest_path.relative_to(output_path)}")
+                
+                # SAFE MOVE: Copy first, verify, then delete original
+                # Step 1: Copy file to destination
+                shutil.copy2(str(file_path), str(dest_path))
+                
+                # Step 2: Verify copy succeeded (check file exists and size matches)
+                if dest_path.exists() and dest_path.stat().st_size == file_path.stat().st_size:
+                    # Step 3: Only delete original after verified copy
+                    file_path.unlink()
+                    print(f"  ✅ Moved to: {dest_path.relative_to(folder_path)}")
+                else:
+                    # Copy failed - remove incomplete copy, keep original
+                    if dest_path.exists():
+                        dest_path.unlink()
+                    print(f"  ⚠️  Copy verification failed, original kept safe")
+                    failed += 1
+                    continue
             else:
-                print(f"  🔍 Would copy to: {dest_path.relative_to(output_path)}")
+                print(f"  🔍 Would move to: {dest_path.relative_to(folder_path)}")
             
             successful += 1
             
         except Exception as e:
             print(f"  ❌ Error: {e}")
             failed += 1
+    
+    # Clean up empty directories
+    if not dry_run:
+        print("\n🧹 Cleaning up empty directories...")
+        for root, dirs, files in os.walk(folder_path, topdown=False):
+            for dir_name in dirs:
+                dir_path = Path(root) / dir_name
+                try:
+                    if not any(dir_path.iterdir()):
+                        dir_path.rmdir()
+                        if verbose:
+                            print(f"   Removed empty: {dir_path.relative_to(folder_path)}")
+                except:
+                    pass
     
     # Summary
     print(f"\n{'='*50}")
@@ -261,24 +294,17 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python music_organizer.py --source ~/Downloads/Music --output ~/Music/Organized
-  python music_organizer.py --source ./messy_music --output ./organized --dry-run
-  python music_organizer.py --source ./music --output ./sorted --verbose
+  python music_organizer.py --folder ~/Music
+  python music_organizer.py --folder ./my_music --dry-run
+  python music_organizer.py --folder ./music --verbose
         """
     )
     
     parser.add_argument(
-        '--source', '-s',
+        '--folder', '-f',
         type=str,
         required=True,
-        help='Source folder containing unorganized music files'
-    )
-    
-    parser.add_argument(
-        '--output', '-o',
-        type=str,
-        required=True,
-        help='Output folder for organized music structure'
+        help='Music folder to scan and organize in-place'
     )
     
     parser.add_argument(
@@ -295,24 +321,19 @@ Examples:
     
     args = parser.parse_args()
     
-    source_path = Path(args.source).resolve()
-    output_path = Path(args.output).resolve()
+    folder_path = Path(args.folder).resolve()
     
-    # Validate source
-    if not source_path.exists():
-        print(f"Error: Source folder does not exist: {source_path}")
+    # Validate folder
+    if not folder_path.exists():
+        print(f"Error: Folder does not exist: {folder_path}")
         sys.exit(1)
     
-    if not source_path.is_dir():
-        print(f"Error: Source is not a directory: {source_path}")
+    if not folder_path.is_dir():
+        print(f"Error: Path is not a directory: {folder_path}")
         sys.exit(1)
-    
-    # Create output if needed
-    if not args.dry_run:
-        output_path.mkdir(parents=True, exist_ok=True)
     
     # Run organizer
-    organize_music(source_path, output_path, args.dry_run, args.verbose)
+    organize_music(folder_path, args.dry_run, args.verbose)
 
 
 if __name__ == "__main__":
